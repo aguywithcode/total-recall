@@ -1,0 +1,5 @@
+requests>=2.28.0
+apsw>=3.40.0
+
+# Optional: ChatGPT scraper
+playwright>=1.40.0

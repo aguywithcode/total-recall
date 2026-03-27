@@ -1,0 +1,21 @@
+# Databases (contain personal conversations)
+*.db
+*.db-journal
+*.db-wal
+
+# Personal data directories
+staging/
+parsed_chats/
+specs/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.env
+
+# Playwright browser profiles
+playwright-*/
+
+# OS
+.DS_Store
