@@ -486,12 +486,16 @@ def scrape_conversation(page, conversation_id, download_assets=True):
                         local_path = download_asset(page, asset_url, assets_dir, filename)
                         if local_path:
                             rel_path = os.path.relpath(local_path, STAGING_DIR)
-                            text_parts.append(f'[image: {rel_path}]')
+                            dalle_prompt = part.get('metadata', {}).get('dalle', {}).get('prompt')
+                            if dalle_prompt:
+                                text_parts.append(f'[image: {rel_path}]\nDALL-E prompt: {dalle_prompt}')
+                            else:
+                                text_parts.append(f'[image: {rel_path}]')
                             msg_assets.append({
                                 'type': 'image',
                                 'asset_id': asset_id,
                                 'local_path': rel_path,
-                                'dalle_prompt': part.get('metadata', {}).get('dalle', {}).get('prompt'),
+                                'dalle_prompt': dalle_prompt,
                             })
                             asset_index += 1
                             continue
@@ -515,7 +519,11 @@ def scrape_conversation(page, conversation_id, download_assets=True):
                                 local_path = download_asset(page, ip_url, assets_dir, ip_filename)
                                 if local_path:
                                     rel_path = os.path.relpath(local_path, STAGING_DIR)
-                                    text_parts.append(f'[image: {rel_path}]')
+                                    ip_dalle_prompt = ip.get('metadata', {}).get('dalle', {}).get('prompt')
+                                    if ip_dalle_prompt:
+                                        text_parts.append(f'[image: {rel_path}]\nDALL-E prompt: {ip_dalle_prompt}')
+                                    else:
+                                        text_parts.append(f'[image: {rel_path}]')
                                     msg_assets.append({
                                         'type': 'image',
                                         'asset_id': ip_asset_id,
