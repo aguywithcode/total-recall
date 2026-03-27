@@ -480,13 +480,14 @@ def scrape_conversation(page, conversation_id, download_assets=True):
                         asset_url = resolve_asset_url(page, asset_id, conv_id)
                     if asset_url and assets_dir:
                         ext = '.png'  # default
-                        if part.get('metadata', {}).get('dalle', {}).get('prompt'):
+                        dalle_meta = (part.get('metadata') or {}).get('dalle') or {}
+                        if dalle_meta.get('prompt'):
                             ext = '.webp'
                         filename = f'{asset_index:03d}_{asset_id[:12]}{ext}'
                         local_path = download_asset(page, asset_url, assets_dir, filename)
                         if local_path:
                             rel_path = os.path.relpath(local_path, STAGING_DIR)
-                            dalle_prompt = part.get('metadata', {}).get('dalle', {}).get('prompt')
+                            dalle_prompt = dalle_meta.get('prompt')
                             if dalle_prompt:
                                 text_parts.append(f'[image: {rel_path}]\nDALL-E prompt: {dalle_prompt}')
                             else:
@@ -514,12 +515,13 @@ def scrape_conversation(page, conversation_id, download_assets=True):
                             if ip_asset_id and download_assets:
                                 ip_url = resolve_asset_url(page, ip_asset_id, conv_id)
                             if ip_url and assets_dir:
-                                ip_ext = '.webp' if ip.get('metadata', {}).get('dalle', {}).get('prompt') else '.png'
+                                ip_dalle_meta = (ip.get('metadata') or {}).get('dalle') or {}
+                                ip_ext = '.webp' if ip_dalle_meta.get('prompt') else '.png'
                                 ip_filename = f'{asset_index:03d}_{ip_asset_id[:12]}{ip_ext}'
                                 local_path = download_asset(page, ip_url, assets_dir, ip_filename)
                                 if local_path:
                                     rel_path = os.path.relpath(local_path, STAGING_DIR)
-                                    ip_dalle_prompt = ip.get('metadata', {}).get('dalle', {}).get('prompt')
+                                    ip_dalle_prompt = ip_dalle_meta.get('prompt')
                                     if ip_dalle_prompt:
                                         text_parts.append(f'[image: {rel_path}]\nDALL-E prompt: {ip_dalle_prompt}')
                                     else:
