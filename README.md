@@ -6,6 +6,8 @@ One SQLite file. No server, no API keys, no cloud. Copy it to another machine an
 
 ---
 
+**[Read the long story](background.md)** of how this was built, including the ChatGPT import saga and how human-AI collaboration actually works in practice.
+
 ## The Problem
 
 Every new Claude Code session starts with amnesia. CLAUDE.md helps, but it's a static summary. Total Recall gives Claude searchable access to your actual conversation history: every decision, every debugging session, every architecture discussion.
