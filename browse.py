@@ -207,7 +207,8 @@ def show_stats(conn):
 
     total_embedded = conn.execute('SELECT COUNT(*) FROM chunk_embeddings').fetchone()[0]
 
-    db_size = os.path.getsize(DEFAULT_DB) / 1024 / 1024
+    db_path = conn.execute("PRAGMA database_list").fetchone()[2] or DEFAULT_DB
+    db_size = os.path.getsize(db_path) / 1024 / 1024
 
     print(f'\n══ Knowledge Graph Stats ══\n')
     print(f'  Chunks:          {total_chunks:,}')
