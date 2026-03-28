@@ -12,6 +12,20 @@ One SQLite file. No server, no API keys, no cloud. Copy it to another machine an
 
 Every new Claude Code session starts with amnesia. CLAUDE.md helps, but it's a static summary. Total Recall gives Claude searchable access to your actual conversation history: every decision, every debugging session, every architecture discussion.
 
+### Without Total Recall (Claude Cowork, fresh session)
+
+![Without Total Recall](assets/demo_cowork_no_memory.png)
+
+> *"It looks like this is a fresh session, so I don't have any context from a previous conversation to pick up from."*
+
+### With Total Recall (Claude Code, fresh session)
+
+![With Total Recall](assets/demo_claude_code_total_recall.png)
+
+> *"We were working on the **Arachne CLI** `chat` command. Specifically fixing name resolution so users can reference agents by artifact name..."*
+
+Same question, same model, same day. The only difference is 25K+ indexed conversation chunks searchable in under a second.
+
 ## What It Does
 
 - Ingests Claude Code's JSONL transcripts into SQLite
