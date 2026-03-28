@@ -89,9 +89,14 @@ def _query(conn, sql, params=()):
     """Execute a query and return list of dicts."""
     cursor = conn.execute(sql, params)
     if conn.backend == 'apsw':
+        first = next(cursor, None)
+        if first is None:
+            return []
         desc = cursor.getdescription()
         col_names = [d[0] for d in desc]
-        return [dict(zip(col_names, row)) for row in cursor.fetchall()]
+        results = [dict(zip(col_names, first))]
+        results.extend(dict(zip(col_names, row)) for row in cursor)
+        return results
     else:
         return [dict(row) for row in cursor.fetchall()]
 
