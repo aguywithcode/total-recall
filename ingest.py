@@ -190,74 +190,84 @@ def ingest(jsonl_path, db_path, no_embed=False, project='global'):
     seq_map = linearise(messages)
 
     # Connect to DB
-    conn = sqlite3.connect(db_path)
+    conn = sqlite3.connect(db_path, isolation_level=None)
     conn.row_factory = sqlite3.Row
     conn.executescript(SCHEMA)
     migrate(conn)
 
-    # Register session
-    conn.execute("""
-        INSERT OR REPLACE INTO sessions(session_id, source_file, ingested_at, message_count, project)
-        VALUES (?, ?, ?, ?, ?)
-    """, (session_id, jsonl_path, datetime.utcnow().isoformat(), len(messages), project))
+    # All-or-nothing: wrap session insert + chunk loop in a single transaction.
+    # If the process is interrupted, the DB rolls back cleanly instead of
+    # leaving partial chunks and a corrupted FTS index.
+    try:
+        conn.execute("BEGIN")
 
-    # Ingest chunks
-    inserted = 0
-    skipped  = 0
-    embedded = 0
-    for msg in messages:
-        uid = msg['uuid']
-
-        # Skip if already exists
-        if conn.execute('SELECT 1 FROM chunks WHERE id=?', (uid,)).fetchone():
-            skipped += 1
-            continue
-
-        content = msg.get('message', {}).get('content', '')
-        role    = msg.get('message', {}).get('role', msg.get('type', ''))
-        text    = extract_text(content, role)
-        ctype   = content_type(content) if isinstance(content, list) else 'text'
-        chash   = hashlib.sha256(text.encode()).hexdigest()
-        is_sc   = 1 if msg.get('isSidechain', False) else 0
-        seq     = seq_map.get(uid, -1)
-
+        # Register session
         conn.execute("""
-            INSERT INTO chunks(id, session_id, parent_id, is_sidechain, timestamp,
-                               role, content_type, text, token_count, content_hash,
-                               source_file, seq_index, project)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            uid,
-            session_id,
-            msg.get('parentUuid'),
-            is_sc,
-            msg.get('timestamp', ''),
-            role,
-            ctype,
-            text,
-            estimate_tokens(text),
-            chash,
-            jsonl_path,
-            seq,
-            project,
-        ))
-        inserted += 1
+            INSERT OR REPLACE INTO sessions(session_id, source_file, ingested_at, message_count, project)
+            VALUES (?, ?, ?, ?, ?)
+        """, (session_id, jsonl_path, datetime.utcnow().isoformat(), len(messages), project))
 
-        # Embed the chunk (skip short/empty text, respect --no-embed)
-        if not no_embed and text and len(text) > 20:
-            try:
-                vec = embed.get_embedding(text)
-                blob = embed.floats_to_blob(vec)
-                conn.execute("""
-                    INSERT OR IGNORE INTO chunk_embeddings(chunk_id, model, embedding, created_at)
-                    VALUES (?, ?, ?, ?)
-                """, (uid, embed.EMBED_MODEL, blob, datetime.utcnow().isoformat()))
-                embedded += 1
-            except Exception as e:
-                print(f'  WARN: embedding failed for {uid[:8]}: {e}')
+        # Ingest chunks
+        inserted = 0
+        skipped  = 0
+        embedded = 0
+        for msg in messages:
+            uid = msg['uuid']
 
-    conn.commit()
-    conn.close()
+            # Skip if already exists
+            if conn.execute('SELECT 1 FROM chunks WHERE id=?', (uid,)).fetchone():
+                skipped += 1
+                continue
+
+            content = msg.get('message', {}).get('content', '')
+            role    = msg.get('message', {}).get('role', msg.get('type', ''))
+            text    = extract_text(content, role)
+            ctype   = content_type(content) if isinstance(content, list) else 'text'
+            chash   = hashlib.sha256(text.encode()).hexdigest()
+            is_sc   = 1 if msg.get('isSidechain', False) else 0
+            seq     = seq_map.get(uid, -1)
+
+            conn.execute("""
+                INSERT INTO chunks(id, session_id, parent_id, is_sidechain, timestamp,
+                                   role, content_type, text, token_count, content_hash,
+                                   source_file, seq_index, project)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                uid,
+                session_id,
+                msg.get('parentUuid'),
+                is_sc,
+                msg.get('timestamp', ''),
+                role,
+                ctype,
+                text,
+                estimate_tokens(text),
+                chash,
+                jsonl_path,
+                seq,
+                project,
+            ))
+            inserted += 1
+
+            # Embed the chunk (skip short/empty text, respect --no-embed)
+            if not no_embed and text and len(text) > 20:
+                try:
+                    vec = embed.get_embedding(text)
+                    blob = embed.floats_to_blob(vec)
+                    conn.execute("""
+                        INSERT OR IGNORE INTO chunk_embeddings(chunk_id, model, embedding, created_at)
+                        VALUES (?, ?, ?, ?)
+                    """, (uid, embed.EMBED_MODEL, blob, datetime.utcnow().isoformat()))
+                    embedded += 1
+                except Exception as e:
+                    print(f'  WARN: embedding failed for {uid[:8]}: {e}')
+
+        conn.execute("COMMIT")
+    except BaseException:
+        conn.execute("ROLLBACK")
+        raise
+    finally:
+        conn.close()
 
     total = inserted + skipped
     print(f'  Result : {inserted} inserted, {skipped} skipped ({total} total)')
