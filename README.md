@@ -210,6 +210,47 @@ python3 retrieve.py "your query" --no-tools
 
 # JSON output for programmatic use
 python3 retrieve.py "your query" --format json
+
+# Show how the search actually ran: backend, seed counts, timings
+python3 retrieve.py "your query" --explain
+```
+
+### When semantic search is unavailable
+
+Retrieval degrades to keyword-only rather than failing outright. Because a
+degraded search otherwise looks identical to a healthy one, the reason is
+always reported on stderr as an XML comment:
+
+```
+<!-- semantic search skipped, keyword results only — embedding service
+     unreachable at http://localhost:11434/api/embeddings [ConnectionError]
+     — is `ollama serve` running? -->
+```
+
+Common causes: Ollama is not running, `requests` is missing from the
+interpreter being used, or the corpus has no embeddings yet (run
+`backfill_embeddings.py`). Use `--explain` for the full picture.
+
+Without `apsw` and `sqlite-vec` installed, vector search still works via a
+brute-force cosine scan — results are equivalent but slower, and the scan
+warns once it exceeds ~1.5s.
+
+---
+
+## Tests
+
+Standard library only, no test dependencies:
+
+```bash
+python3 -m unittest discover -s tests -v
+```
+
+Tests needing the corpus or a running Ollama skip automatically when those
+aren't available. To additionally assert that output is unchanged relative to
+an earlier revision, point `PARITY_REF` at any git ref:
+
+```bash
+PARITY_REF=HEAD~1 python3 -m unittest discover -s tests -v
 ```
 
 ---
