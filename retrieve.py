@@ -21,6 +21,7 @@ Options:
   --roles ROLES    Comma-separated roles to include: user,assistant (default: both)
   --no-tools       Exclude pure tool_use/tool_result chunks
   --no-vectors     Disable vector search (FTS5 only)
+  --explain        Print retrieval diagnostics to stderr (backend, seeds, timings)
 
 Output (--format context):
   A formatted block of conversation excerpts ready to paste into a Claude prompt.
@@ -35,8 +36,83 @@ import os
 import argparse
 import re
 import struct
+import time
 
 DEFAULT_DB = os.path.join(os.path.dirname(__file__), 'session_memory.db')
+
+# Brute-force scans above this many seconds are worth complaining about.
+SLOW_VECTOR_SECONDS = 1.5
+
+
+# ── DIAGNOSTICS ──────────────────────────────────────────────────────────────
+
+class VectorSearchUnavailable(RuntimeError):
+    """Semantic search could not run; retrieval degrades to keyword-only."""
+
+
+class RetrievalDiagnostics:
+    """Records how a retrieval actually executed, including degraded paths.
+
+    Vector search fails soft on purpose: if the embedding service or the
+    embeddings themselves are missing, keyword results are still better than
+    an error. The problem was that a degraded search looked identical to a
+    healthy one, so silent quality loss could persist indefinitely. This type
+    makes the degradation inspectable and, where it matters, noisy.
+    """
+
+    def __init__(self):
+        self.backend = None            # 'apsw' | 'sqlite3'
+        self.vector_mode = 'pending'   # knn | brute-force | disabled | unavailable
+        self.vector_reason = None      # why degraded, when it is
+        self.fts_seeds = 0
+        self.vector_seeds = 0
+        self.fused_seeds = 0
+        self.embed_seconds = None
+        self.vector_seconds = None
+        self.scanned_embeddings = 0
+        self.dim_mismatches = 0
+        self.warnings = []
+
+    def warn(self, message):
+        """Record a user-visible warning, de-duplicated."""
+        if message not in self.warnings:
+            self.warnings.append(message)
+
+    @property
+    def degraded(self):
+        """True when result *quality* was affected, not merely performance."""
+        return self.vector_mode == 'unavailable' or bool(self.warnings)
+
+    @property
+    def suboptimal(self):
+        """True when results are complete but the slow path was used."""
+        return self.vector_mode == 'brute-force'
+
+    def summary_lines(self):
+        lines = [
+            f'backend={self.backend} vector_mode={self.vector_mode}',
+            f'seeds: fts={self.fts_seeds} vector={self.vector_seeds} '
+            f'fused={self.fused_seeds}',
+        ]
+        if self.vector_reason:
+            lines.append(f'vector_reason: {self.vector_reason}')
+        if self.embed_seconds is not None:
+            lines.append(f'embed_time={self.embed_seconds:.2f}s')
+        if self.vector_seconds is not None:
+            lines.append(f'vector_time={self.vector_seconds:.2f}s '
+                         f'(scanned {self.scanned_embeddings} embeddings)')
+        if self.dim_mismatches:
+            lines.append(f'dimension_mismatches={self.dim_mismatches}')
+        return lines
+
+    def emit(self, stream=sys.stderr, verbose=False):
+        """Write warnings (and optionally a full summary) as XML comments."""
+        for message in self.warnings:
+            print(f'<!-- {message} -->', file=stream)
+        if verbose:
+            for line in self.summary_lines():
+                print(f'<!-- diag: {line} -->', file=stream)
+
 
 # ── DB CONNECTION ────────────────────────────────────────────────────────────
 
@@ -54,8 +130,14 @@ class DBConn:
         return self._conn.close()
 
 
-def open_db(db_path):
-    """Open DB with apsw + sqlite-vec if available, fall back to sqlite3."""
+def open_db(db_path, diag=None):
+    """Open DB with apsw + sqlite-vec if available, fall back to sqlite3.
+
+    Import failure and extension-load failure are handled separately: the
+    former is the ordinary "not installed" case, while the latter (arch
+    mismatch, sandbox restrictions, corrupt dylib) previously escaped as an
+    unhandled exception even though a perfectly good fallback existed.
+    """
     if not os.path.exists(db_path):
         print(f'ERROR: DB not found: {db_path}', file=sys.stderr)
         print('Run ingest.py first.', file=sys.stderr)
@@ -64,16 +146,38 @@ def open_db(db_path):
     try:
         import apsw
         import sqlite_vec
+    except ImportError as exc:
+        return _open_sqlite3(
+            db_path, diag,
+            f'sqlite-vec/apsw not installed ({exc}); using brute-force scan',
+        )
+
+    try:
         conn = apsw.Connection(db_path, flags=apsw.SQLITE_OPEN_READONLY)
         conn.enable_load_extension(True)
         conn.load_extension(sqlite_vec.loadable_path())
         conn.enable_load_extension(False)
-        return DBConn(conn, has_vec=True, backend='apsw')
-    except ImportError:
-        import sqlite3
-        conn = sqlite3.connect(db_path)
-        conn.row_factory = sqlite3.Row
-        return DBConn(conn, has_vec=False, backend='sqlite3')
+    except Exception as exc:
+        return _open_sqlite3(
+            db_path, diag,
+            f'sqlite-vec present but failed to load '
+            f'({type(exc).__name__}: {exc}); using brute-force scan',
+        )
+
+    if diag is not None:
+        diag.backend = 'apsw'
+    return DBConn(conn, has_vec=True, backend='apsw')
+
+
+def _open_sqlite3(db_path, diag, reason):
+    """Open the stdlib sqlite3 fallback connection, recording why."""
+    import sqlite3
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    if diag is not None:
+        diag.backend = 'sqlite3'
+        diag.vector_reason = reason
+    return DBConn(conn, has_vec=False, backend='sqlite3')
 
 
 def _row_to_dict(row, conn):
@@ -161,18 +265,49 @@ def fts_search(conn, query, top_k, session_id=None, roles=None, no_tools=False, 
 # ── VECTOR SEARCH (sqlite-vec KNN) ──────────────────────────────────────────
 
 def vector_search(conn, query_text, top_k, session_id=None, roles=None,
-                  no_tools=False, project=None):
+                  no_tools=False, project=None, diag=None):
     """
     Vector search using sqlite-vec KNN index (fast) with brute-force fallback.
     Returns list of (similarity, chunk_dict) tuples, descending by similarity.
+
+    Raises VectorSearchUnavailable when the query cannot be embedded, so the
+    caller can degrade to keyword search with a specific, actionable reason
+    rather than a bare exception string.
     """
     import embed
-    query_vec = embed.get_embedding(query_text)
+
+    started = time.perf_counter()
+    try:
+        query_vec = embed.get_embedding(query_text)
+    except Exception as exc:
+        raise VectorSearchUnavailable(_describe_embed_failure(exc, embed)) from exc
+    if diag is not None:
+        diag.embed_seconds = time.perf_counter() - started
 
     if conn.has_vec:
-        return _vec_knn_search(conn, query_vec, top_k, session_id, roles, no_tools, project)
-    else:
-        return _brute_force_search(conn, query_vec, top_k, session_id, roles, no_tools, project)
+        if diag is not None:
+            diag.vector_mode = 'knn'
+        return _vec_knn_search(conn, query_vec, top_k, session_id, roles,
+                               no_tools, project)
+
+    if diag is not None:
+        diag.vector_mode = 'brute-force'
+    return _brute_force_search(conn, query_vec, top_k, session_id, roles,
+                               no_tools, project, diag=diag)
+
+
+def _describe_embed_failure(exc, embed_module):
+    """Turn an embedding exception into a message that says what to do."""
+    name = type(exc).__name__
+    if isinstance(exc, ImportError):
+        return (f'embedding dependency missing ({exc}) — '
+                f'install it for this interpreter: {sys.executable}')
+    if name in ('ConnectionError', 'ConnectTimeout', 'ReadTimeout', 'Timeout',
+                'NewConnectionError', 'MaxRetryError'):
+        url = getattr(embed_module, 'OLLAMA_URL', 'the embedding service')
+        return (f'embedding service unreachable at {url} [{name}] — '
+                f'is `ollama serve` running?')
+    return f'{name}: {exc}'
 
 
 def _vec_knn_search(conn, query_vec, top_k, session_id=None, roles=None,
@@ -220,12 +355,19 @@ def _vec_knn_search(conn, query_vec, top_k, session_id=None, roles=None,
 
 
 def _brute_force_search(conn, query_vec, top_k, session_id=None, roles=None,
-                        no_tools=False, project=None):
-    """Fallback brute-force cosine similarity (no sqlite-vec)."""
+                        no_tools=False, project=None, diag=None):
+    """Fallback cosine-similarity scan for when sqlite-vec is unavailable.
+
+    Two-phase by design. Phase 1 pulls only (id, embedding) for candidate
+    chunks and ranks them; phase 2 hydrates full rows for the surviving top_k.
+    The previous single-phase version selected `c.*` for every embedded chunk,
+    materialising the entire corpus text just to score it, and carried the raw
+    embedding blob downstream into the seed rows.
+    """
     import embed
 
     q = """
-        SELECT ce.embedding, c.*
+        SELECT ce.chunk_id AS id, ce.embedding
         FROM chunk_embeddings ce
         JOIN chunks c ON c.id = ce.chunk_id
         WHERE c.is_sidechain = 0
@@ -242,17 +384,48 @@ def _brute_force_search(conn, query_vec, top_k, session_id=None, roles=None,
         q += " AND c.content_type NOT IN ('tool_use', 'tool_result')"
 
     rows = _query(conn, q, params)
+    if diag is not None:
+        diag.scanned_embeddings = len(rows)
+    if not rows:
+        return []
 
+    expected_dim = len(query_vec)
     scored = []
+    mismatches = 0
+
     for row in rows:
         blob = row['embedding']
+        if not blob:
+            continue
         n = len(blob) // 4
-        chunk_vec = list(struct.unpack(f'<{n}f', blob))
-        sim = embed.cosine_similarity(query_vec, chunk_vec)
-        scored.append((sim, row))
+        # A dimension mismatch means the row was embedded with a different
+        # model. Silently zipping vectors of unequal length would truncate to
+        # the shorter one and yield a plausible-looking but meaningless score.
+        if n != expected_dim:
+            mismatches += 1
+            continue
+        chunk_vec = struct.unpack(f'<{n}f', blob)
+        scored.append((embed.cosine_similarity(query_vec, chunk_vec), row['id']))
+
+    if mismatches and diag is not None:
+        diag.dim_mismatches = mismatches
+        diag.warn(f'{mismatches} embedding(s) skipped: dimension != {expected_dim} '
+                  f'(re-run backfill_embeddings.py to normalise)')
+
+    if not scored:
+        return []
 
     scored.sort(key=lambda x: x[0], reverse=True)
-    return scored[:top_k]
+    top = scored[:top_k]
+
+    placeholders = ','.join('?' * len(top))
+    hydrated = {
+        row['id']: row
+        for row in _query(conn,
+                          f'SELECT * FROM chunks WHERE id IN ({placeholders})',
+                          [cid for _, cid in top])
+    }
+    return [(sim, hydrated[cid]) for sim, cid in top if cid in hydrated]
 
 
 # ── RRF FUSION ────────────────────────────────────────────────────────────────
@@ -342,7 +515,8 @@ def get_semantic_links(conn, chunk_id, max_links=3, min_similarity=0.75):
 
 def retrieve(query, db_path=DEFAULT_DB, top_k=5, window=2, depth=3,
              budget=20, token_budget=6000, session_id=None,
-             roles=None, no_tools=False, no_vectors=False, project=None):
+             roles=None, no_tools=False, no_vectors=False, project=None,
+             diag=None):
     """
     Hybrid retrieval pipeline:
     1a. FTS5 search → top_k keyword seeds
@@ -353,19 +527,52 @@ def retrieve(query, db_path=DEFAULT_DB, top_k=5, window=2, depth=3,
     4. For each seed: traverse semantic links (cross-session back pointers)
     5. Deduplicate, sort by seq_index, apply budget cap
     6. Return ordered list of chunk dicts
+
+    Pass a RetrievalDiagnostics instance as `diag` to inspect how the search
+    actually ran. When no instance is supplied, warnings are written to stderr
+    so degradation is never entirely silent.
     """
-    conn = open_db(db_path)
+    owns_diag = diag is None
+    if owns_diag:
+        diag = RetrievalDiagnostics()
+
+    conn = open_db(db_path, diag=diag)
 
     # 1a. FTS seeds
     fts_seeds = fts_search(conn, query, top_k, session_id, roles, no_tools, project)
+    diag.fts_seeds = len(fts_seeds)
 
     # 1b. Vector seeds
     vec_seeds = []
-    if not no_vectors:
+    if no_vectors:
+        diag.vector_mode = 'disabled'
+        diag.vector_reason = 'disabled by caller (--no-vectors)'
+    else:
+        started = time.perf_counter()
         try:
-            vec_seeds = vector_search(conn, query, top_k, session_id, roles, no_tools, project)
-        except Exception as e:
-            print(f'<!-- vector search unavailable: {e} -->', file=sys.stderr)
+            vec_seeds = vector_search(conn, query, top_k, session_id, roles,
+                                      no_tools, project, diag=diag)
+        except VectorSearchUnavailable as exc:
+            diag.vector_mode = 'unavailable'
+            diag.vector_reason = str(exc)
+            diag.warn(f'semantic search skipped, keyword results only — {exc}')
+        except Exception as exc:
+            # Not an expected degradation path; still fall back, but loudly.
+            diag.vector_mode = 'unavailable'
+            diag.vector_reason = f'unexpected {type(exc).__name__}: {exc}'
+            diag.warn(f'semantic search failed unexpectedly, keyword results '
+                      f'only — {type(exc).__name__}: {exc}')
+        else:
+            diag.vector_seconds = time.perf_counter() - started
+            diag.vector_seeds = len(vec_seeds)
+            if not vec_seeds:
+                diag.warn('semantic search returned no candidates — the corpus '
+                          'may have no embeddings yet (run backfill_embeddings.py)')
+            elif (diag.vector_mode == 'brute-force'
+                  and diag.vector_seconds > SLOW_VECTOR_SECONDS):
+                diag.warn(f'brute-force vector scan took {diag.vector_seconds:.1f}s '
+                          f'over {diag.scanned_embeddings} embeddings — install '
+                          f'`apsw` and `sqlite-vec` for indexed KNN')
 
     # 1c. Fuse with RRF or fall back to FTS-only
     if vec_seeds:
@@ -376,9 +583,12 @@ def retrieve(query, db_path=DEFAULT_DB, top_k=5, window=2, depth=3,
         seeds = [all_rows[cid] for cid in fused_ids if cid in all_rows]
     else:
         seeds = fts_seeds
+    diag.fused_seeds = len(seeds)
 
     if not seeds:
         conn.close()
+        if owns_diag:
+            diag.emit()
         return []
 
     collected = {s['id']: s for s in seeds}
@@ -408,8 +618,11 @@ def retrieve(query, db_path=DEFAULT_DB, top_k=5, window=2, depth=3,
             for row in linked:
                 if row['id'] not in collected:
                     collected[row['id']] = row
-    except Exception:
-        pass  # table may not exist yet
+    except Exception as exc:
+        # Optional enrichment: the semantic_links table may not exist yet.
+        # Recorded rather than swallowed, so a genuine schema problem is visible.
+        diag.warn(f'semantic link traversal skipped '
+                  f'({type(exc).__name__}: {exc})')
 
     conn.close()
 
@@ -438,6 +651,8 @@ def retrieve(query, db_path=DEFAULT_DB, top_k=5, window=2, depth=3,
         result.append(row)
         total_tokens += t
 
+    if owns_diag:
+        diag.emit()
     return result
 
 
@@ -508,11 +723,14 @@ def main():
     parser.add_argument('--no-tools', action='store_true')
     parser.add_argument('--no-vectors', action='store_true',
                         help='Disable vector search, use FTS5 only')
+    parser.add_argument('--explain', action='store_true',
+                        help='Print retrieval diagnostics to stderr')
     args = parser.parse_args()
 
     roles = [r.strip() for r in args.roles.split(',')] if args.roles else None
     project = None if args.global_search else args.project
 
+    diag = RetrievalDiagnostics()
     chunks = retrieve(
         query       = args.query,
         db_path     = args.db,
@@ -526,7 +744,9 @@ def main():
         no_tools    = args.no_tools,
         no_vectors  = args.no_vectors,
         project     = project,
+        diag        = diag,
     )
+    diag.emit(verbose=args.explain)
 
     if not chunks:
         print(f'No results for: {args.query}', file=sys.stderr)
