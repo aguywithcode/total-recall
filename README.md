@@ -237,6 +237,24 @@ warns once it exceeds ~1.5s.
 
 ---
 
+## Tests
+
+Standard library only, no test dependencies:
+
+```bash
+python3 -m unittest discover -s tests -v
+```
+
+Tests needing the corpus or a running Ollama skip automatically when those
+aren't available. To additionally assert that output is unchanged relative to
+an earlier revision, point `PARITY_REF` at any git ref:
+
+```bash
+PARITY_REF=HEAD~1 python3 -m unittest discover -s tests -v
+```
+
+---
+
 ## ChatGPT Scraper
 
 Import conversations from ChatGPT (uses Playwright for auth, then calls ChatGPT's backend API):
